@@ -184,6 +184,7 @@ class ReserveError(Exception):
 
 class HustReserve:
     CAS_HOST = 'pass.hust.edu.cn'
+    VENUE_HOST = 'pecg.hust.edu.cn'
     VENUE_URL = 'https://pecg.hust.edu.cn/cggl/index1'
     VENUE_LINKS = (By.XPATH, '/html/body/div[2]/div[2]/ul/li//a')
     NEXT_DAY = (By.XPATH, '/html/body/div[2]/div[2]/div[2]/div[1]/div[3]')
@@ -265,8 +266,7 @@ class HustReserve:
                 return
             while name := self.name_choice():
                 self.stadium_choice(name)
-                self.browser.get(self.VENUE_URL)
-                self.wait.until(lambda _: self._login_state() == ('ready',))
+                self._open_venue_index()
         except ReserveError as error:
             messagebox.showerror('操作未完成', str(error))
         except TimeoutException:
@@ -291,13 +291,26 @@ class HustReserve:
 
     def _is_venue(self):
         url = urlsplit(self.browser.current_url)
-        return (url.scheme == 'https' and url.netloc == 'pecg.hust.edu.cn'
+        return (url.scheme == 'https' and url.netloc == self.VENUE_HOST
                 and url.path.startswith('/cggl/'))
+
+    def _open_venue_index(self):
+        self.browser.get(self.VENUE_URL)
+
+        def ready(_):
+            if not self._is_venue():
+                raise ReserveError('未能通过 HTTPS 打开已登录的场地系统，请在学校浏览器页面核对后重试。')
+            return self.browser.find_elements(*self.VENUE_LINKS)
+
+        self.wait.until(ready)
 
     def _login_state(self):
         if self._is_venue():
             return ('ready',) if self.browser.find_elements(*self.VENUE_LINKS) else None
         if not self._is_cas():
+            url = urlsplit(self.browser.current_url)
+            if url.scheme == 'http' and url.netloc == self.VENUE_HOST:
+                return ('venue_redirect',)
             raise ReserveError('登录跳转到了未知地址，已停止。')
         error_el = self._visible('errormsg')
         error = error_el.text.strip() if error_el else ''
@@ -329,6 +342,9 @@ class HustReserve:
         submitted = False
         while state[0] != 'ready':
             kind = state[0]
+            if kind == 'venue_redirect':
+                self._open_venue_index()
+                return True
             if kind == 'rejected':
                 raise ReserveError('学校拒绝登录，请核对账号密码或在学校页面查看提示。')
             if kind in retries:
