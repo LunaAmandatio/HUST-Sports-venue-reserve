@@ -588,18 +588,20 @@ class HustReserve:
         win = tk.Tk()
         win.title(f'{name} · {visit_date:%Y-%m-%d}')
         win.geometry('480x460')
-        lines = [
-            f"{item['label']} · 第 {item['idx']} 场地 · {item['status']}"
-            for item in results
-        ]
         if unconfirmed:
             tk.Label(win, text=f'以下时段未能确认或未扫描：{", ".join(unconfirmed)}',
                      wraplength=440, justify='left').pack(fill='x', pady=6)
         scrollbar = tk.Scrollbar(win)
         lb = tk.Listbox(win, width=60, yscrollcommand=scrollbar.set)
         scrollbar.config(command=lb.yview)
-        for line in lines:
-            lb.insert(tk.END, line)
+        status_colors = {'已预约': '#b91c1c', '未预约': '#166534', '可预约': '#166534'}
+        for row, item in enumerate(results):
+            status = item['status']
+            lb.insert(tk.END, f"{item['label']} · 第 {item['idx']} 场地 · {status}")
+            color = status_colors.get(status)
+            if color:
+                lb.itemconfig(row, foreground=color, selectforeground=color,
+                              selectbackground='#dbeafe')
 
         def book():
             if unconfirmed:
