@@ -18,5 +18,5 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install -r requirements.txt
-      - run: python -m compileall -q hust_reserve.py legacy_venue_search.py scheduled_reservation.py repeat_reservation.py
-      - run: python hust_reserve.py --help
+      - run: python -m compileall -q main.py hust_reserve.py src
+      - run: python main.py --help

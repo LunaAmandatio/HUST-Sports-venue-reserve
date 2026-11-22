@@ -1,15 +1,17 @@
-import argparse
 import os
 import re
 import time
 import tkinter as tk
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from tkinter import messagebox, simpledialog
 from urllib.parse import urlsplit
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 from selenium import webdriver
 from selenium.common.exceptions import (
-    NoSuchElementException, StaleElementReferenceException, TimeoutException, WebDriverException,
+    NoSuchElementException, NoSuchWindowException, StaleElementReferenceException, TimeoutException,
+    WebDriverException,
 )
 from selenium.webdriver.common.by import By
 from selenium.webdriver.edge.options import Options as EdgeOptions
@@ -17,165 +19,9 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import Select, WebDriverWait
 
 
-# 浏览器侧验证码识别（移植自 Tampermonkey 脚本：omggif + tesseract.js）。
-# 用 execute_async_script 注入；arguments[-1] 是 Selenium 注入的回调。
-CAPTCHA_JS = r"""
-const callback = arguments[arguments.length - 1];
-(async () => {
-    const loadScript = (src) => new Promise((resolve, reject) => {
-        const s = document.createElement('script');
-        s.src = src;
-        s.onload = resolve;
-        s.onerror = () => reject(new Error('load ' + src));
-        document.head.appendChild(s);
-    });
-    try {
-        if (typeof Tesseract === 'undefined') {
-            await loadScript('https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js');
-        }
-        if (typeof GifReader === 'undefined') {
-            await loadScript('https://cdn.jsdelivr.net/npm/omggif@1.0.10/omggif.min.js');
-        }
-
-        const img = document.querySelector('#codeImage');
-        const input = document.querySelector('#code');
-        if (!img || !input) return callback('ERR:no img/input');
-
-        // 用原始 src 抓 GIF（仅当当前 src 已经是 blob 时，跳过抓取直接用 img）。
-        let gifData;
-        if (img.src && img.src.startsWith('blob:')) {
-            const resp = await fetch(img.src);
-            gifData = await resp.arrayBuffer();
-        } else {
-            const resp = await fetch(img.src);
-            if (!resp.ok) return callback('ERR:fetch ' + resp.status);
-            gifData = await resp.arrayBuffer();
-            // 立刻把 img.src 替换成本地 blob，防止页面再次请求 /code
-            // 触发服务器重新生成验证码导致 OCR 结果失效（这是原 Tampermonkey 脚本的关键步骤）。
-            try {
-                if (window.__hustBlobUrl) URL.revokeObjectURL(window.__hustBlobUrl);
-                const blob = new Blob([gifData], {type: 'image/gif'});
-                const blobUrl = URL.createObjectURL(blob);
-                window.__hustBlobUrl = blobUrl;
-                img.src = blobUrl;
-            } catch (e) { /* 即使失败也继续 OCR */ }
-        }
-
-        const reader = new GifReader(new Uint8Array(gifData));
-        const numFrames = reader.numFrames();
-        const W = reader.width, H = reader.height;
-        const framesToExtract = 4;
-        const selectedIdx = [];
-        for (let i = 0; i < numFrames && selectedIdx.length < framesToExtract; i++) {
-            selectedIdx.push(i);
-        }
-        if (selectedIdx.length === 0) return callback('ERR:no frames');
-
-        const FG = 0, BG = 255, bgT = 254;
-        const processFrame = (canvas) => {
-            const ctx = canvas.getContext('2d', {willReadFrequently: true});
-            const w = canvas.width, h = canvas.height;
-            const imageData = ctx.getImageData(0, 0, w, h);
-            const data = imageData.data;
-            for (let i = 0; i < data.length; i += 4) {
-                data[i + 3] = 255;
-                if (data[i] > bgT && data[i + 1] > bgT && data[i + 2] > bgT) {
-                    data[i] = data[i + 1] = data[i + 2] = BG;
-                } else {
-                    data[i] = data[i + 1] = data[i + 2] = FG;
-                }
-            }
-            const getPx = (d, x, y) => (x < 0 || x >= w || y < 0 || y >= h) ? BG : d[(y * w + x) * 4];
-            const setPx = (d, x, y, v) => {
-                const i = (y * w + x) * 4;
-                d[i] = d[i + 1] = d[i + 2] = v;
-                d[i + 3] = 255;
-            };
-            const orig = new Uint8ClampedArray(data);
-            const proc = new Uint8ClampedArray(data);
-            for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-                let boundary = false;
-                for (let ny = -1; ny <= 0 && !boundary; ny++) {
-                    for (let nx = -1; nx <= 0; nx++) {
-                        if (getPx(orig, x + nx, y + ny) === BG) { boundary = true; break; }
-                    }
-                }
-                setPx(proc, x, y, boundary ? BG : FG);
-            }
-            const eroded = new Uint8ClampedArray(proc);
-            for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-                let hasFg = false;
-                for (let ny = -1; ny <= 0 && !hasFg; ny++) {
-                    for (let nx = -1; nx <= 0; nx++) {
-                        if (getPx(eroded, x + nx, y + ny) === FG) { hasFg = true; break; }
-                    }
-                }
-                setPx(proc, x, y, hasFg ? FG : getPx(eroded, x, y));
-            }
-            imageData.data.set(proc);
-            return imageData;
-        };
-
-        const frameCanvas = document.createElement('canvas');
-        frameCanvas.width = W;
-        frameCanvas.height = H;
-        const frameCtx = frameCanvas.getContext('2d', {willReadFrequently: true});
-        const processed = [];
-        for (const idx of selectedIdx) {
-            try {
-                const info = reader.frameInfo(idx);
-                if (frameCanvas.width !== info.width || frameCanvas.height !== info.height) {
-                    frameCanvas.width = info.width;
-                    frameCanvas.height = info.height;
-                }
-                const fid = frameCtx.createImageData(frameCanvas.width, frameCanvas.height);
-                reader.decodeAndBlitFrameRGBA(idx, fid.data);
-                frameCtx.putImageData(fid, 0, 0);
-                processed.push(processFrame(frameCanvas));
-            } catch (e) { /* skip bad frame */ }
-        }
-        if (processed.length === 0) return callback('ERR:no processed');
-
-        const merged = document.createElement('canvas');
-        merged.width = W;
-        merged.height = H;
-        const mCtx = merged.getContext('2d');
-        const mid = mCtx.createImageData(W, H);
-        const md = mid.data;
-        for (let i = 0; i < md.length; i += 4) {
-            md[i] = md[i + 1] = md[i + 2] = 255;
-            md[i + 3] = 255;
-        }
-        processed.forEach(fd => {
-            const d = fd.data;
-            for (let i = 0; i < d.length; i += 4) {
-                if (d[i] === 0) { md[i] = md[i + 1] = md[i + 2] = 0; }
-            }
-        });
-        mCtx.putImageData(mid, 0, 0);
-
-        const worker = await Tesseract.createWorker('eng', 1);
-        await worker.setParameters({
-            tessedit_char_whitelist: '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ',
-            tessedit_pageseg_mode: Tesseract.PSM.SINGLE_LINE,
-        });
-        const {data: {text}} = await worker.recognize(merged);
-        await worker.terminate();
-
-        const code = text.replace(/[^a-zA-Z0-9]/g, '');
-        if (code.length === 4) {
-            input.value = code;
-            input.dispatchEvent(new Event('input', {bubbles: true}));
-            input.dispatchEvent(new Event('change', {bubbles: true}));
-            callback(code);
-        } else {
-            callback('ERR:len ' + code.length);
-        }
-    } catch (e) {
-        callback('ERR:' + (e && e.message ? e.message : String(e)));
-    }
-})();
-"""
+BROWSER_SCRIPTS = Path(__file__).with_name('src') / 'browser'
+CAPTCHA_JS = (BROWSER_SCRIPTS / 'captcha.js').read_text(encoding='utf-8')
+PAYMENT_CODE_JS = (BROWSER_SCRIPTS / 'payment_code.js').read_text(encoding='utf-8')
 
 
 class ReserveError(Exception):
@@ -183,8 +29,12 @@ class ReserveError(Exception):
 
 
 class HustReserve:
+    MODE_NAME = '场地查询'
+    MULTIPLE_SLOTS = True
+    SCHOOL_TZ = timezone(timedelta(hours=8))
     CAS_HOST = 'pass.hust.edu.cn'
     VENUE_HOST = 'pecg.hust.edu.cn'
+    PAYMENT_HOST = 'pay.hust.edu.cn'
     VENUE_URL = 'https://pecg.hust.edu.cn/cggl/index1'
     VENUE_LINKS = (By.XPATH, '/html/body/div[2]/div[2]/ul/li//a')
     NEXT_DAY = (By.XPATH, '/html/body/div[2]/div[2]/div[2]/div[1]/div[3]')
@@ -213,18 +63,23 @@ class HustReserve:
         '游泳馆羽毛球场':             (15, 'div[3]'),
     }
 
-    def __init__(self, env_file='.env', headless=False, manual_captcha=False):
+    def __init__(self, env_file='.env', headless=True, manual_captcha=False):
         self.env_file = env_file
         self.headless = headless
         self.browser = None
         self.wait = None
-        self.en_list = []
         self.force_manual_captcha = manual_captcha
 
-    # ===== entry =====
-    def run(self):
+    # 程序入口：配置齐全时直接登录；手动启动模式保留确认窗口。
+    def run(self, manual_start=False):
+        if not manual_start:
+            account, password = self._credentials()
+            if account and password:
+                self.start(account, password)
+                return
+
         root = tk.Tk()
-        root.title('HUST 场地查询')
+        root.title(f'HUST · {self.MODE_NAME}')
         root.geometry('500x500')
         tk.Label(
             root,
@@ -233,8 +88,13 @@ class HustReserve:
         ).pack()
 
         def on_start():
+            account, password = self._credentials()
+            if not account or not password:
+                messagebox.showerror('缺少登录配置', '请在 .env 或 --env-file 指定的文件中填写 account 和 password。',
+                                     parent=root)
+                return
             root.destroy()
-            self.start()
+            self.start(account, password)
 
         tk.Button(root, text='登录并查询', width=20, height=5,
                   command=on_start, bg='red').place(x=170, y=250)
@@ -242,14 +102,14 @@ class HustReserve:
                  width=100, height=10).pack(side='bottom')
         root.mainloop()
 
-    # ===== login =====
-    def start(self):
-        load_dotenv(self.env_file, interpolate=False)
-        account = (os.getenv('account') or '').strip()
-        password = os.getenv('password') or ''
-        if not account or not password:
-            messagebox.showerror('缺少登录配置', '请在 .env 或 --env-file 指定的文件中填写 account 和 password。')
-            return
+    # 统一身份认证：先识别页面状态，学校要求时才输入验证码。
+    def _credentials(self):
+        config = dotenv_values(self.env_file, interpolate=False)
+        account = (os.environ.get('account', config.get('account')) or '').strip()
+        password = os.environ.get('password', config.get('password')) or ''
+        return account, password
+
+    def start(self, account, password):
         options = EdgeOptions()
         if self.headless:
             options.add_argument('--headless=new')
@@ -428,7 +288,7 @@ class HustReserve:
         win.mainloop()
         return result[0] if result else None
 
-    # ===== stadium =====
+    # 场馆选择与学校页面定位。
     def name_choice(self):
         win = tk.Tk()
         win.title('选择体育馆（关闭窗口退出）')
@@ -450,6 +310,19 @@ class HustReserve:
         return picked[0] if picked else None
 
     def stadium_choice(self, name):
+        day = self.day_choice()
+        if day is None:
+            return
+        visit_date = self.school_now().date() + timedelta(days=day)
+        schedule = self._open_stadium(name, day)
+        slots = self._scan_choice(schedule[2])
+        if slots:
+            self.run_selection(name, visit_date, slots)
+
+    def run_selection(self, name, visit_date, slots):
+        raise NotImplementedError('由所选模式处理查询或预约')
+
+    def _open_stadium(self, name, days_ahead):
         if not self._is_venue():
             raise ReserveError('场地登录会话已失效，请重新登录。')
         li_idx, div_suffix = self.STADIUMS[name]
@@ -457,19 +330,16 @@ class HustReserve:
         el = self.wait.until(EC.element_to_be_clickable((By.XPATH, xpath)))
         el.click()
         schedule = self._wait_schedule()
-        day = self.day_choice()
-        if day is None:
-            return
-        for _ in range(day):
-            before = self._schedule()
+        for _ in range(days_ahead):
+            before = schedule
             self.wait.until(EC.element_to_be_clickable(self.NEXT_DAY)).click()
             schedule = self._wait_schedule(before=before)
-        slots = self._scan_choice(schedule[2])
-        if slots:
-            self.en_list, unconfirmed = self.scan_slots(slots)
-            self.scenes(name, ('今天', '明天', '后天')[day], unconfirmed)
+        return schedule
 
-    # ===== day =====
+    # 日期和时段选择：时段以学校页面为准，不在各模式中重复写死。
+    def school_now(self):
+        return datetime.now(self.SCHOOL_TZ)
+
     def day_choice(self):
         win = tk.Tk()
         win.title('日期选择')
@@ -495,9 +365,10 @@ class HustReserve:
             messagebox.showinfo('场地查询', '学校页面没有提供可扫描的时段。')
             return None
         win = tk.Tk()
-        win.title('选择时段（可多选）')
+        win.title('选择时段（可多选）' if self.MULTIPLE_SLOTS else '选择一个预约时段')
         picked = []
-        listbox = tk.Listbox(win, selectmode='extended', width=32, height=min(len(slots), 20))
+        listbox = tk.Listbox(win, selectmode='extended' if self.MULTIPLE_SLOTS else 'browse',
+                             width=32, height=min(len(slots), 20))
         for _, label in slots:
             listbox.insert(tk.END, label)
 
@@ -507,11 +378,14 @@ class HustReserve:
                 win.destroy()
 
         listbox.pack(padx=8, pady=6, fill='both', expand=True)
-        tk.Button(win, text='扫描选中时段', command=lambda: confirm(listbox.curselection())).pack()
-        tk.Button(win, text='扫描全天', command=lambda: confirm(range(len(slots)))).pack(pady=4)
+        tk.Button(win, text='扫描选中时段' if self.MULTIPLE_SLOTS else '确定时段',
+                  command=lambda: confirm(listbox.curselection())).pack()
+        if self.MULTIPLE_SLOTS:
+            tk.Button(win, text='扫描全天', command=lambda: confirm(range(len(slots)))).pack(pady=4)
         win.mainloop()
         return picked
 
+    # 扫描场地：切换时段后等待新状态，避免把上一时段的空场算进来。
     def _schedule(self):
         if not self._is_venue():
             raise ReserveError('场地登录会话已失效，请重新登录。')
@@ -572,14 +446,151 @@ class HustReserve:
                                 'court_id': court_id, 'status': status})
         return results, []
 
-    # ===== booking =====
-    def scenes(self, name, day, unconfirmed):
+    # 定时和轮询都重新加载目标日期；跨午夜不把「今天」误当成新日期。
+    def scan_target(self, name, visit_date, slots):
+        days_ahead = (visit_date - self.school_now().date()).days
+        if not 0 <= days_ahead <= 2:
+            raise ReserveError('目标日期不在学校页面可查询的三天内。')
+        self._open_venue_index()
+        self._open_stadium(name, days_ahead)
+        return self.scan_slots(slots)
+
+    def wait_until(self, title, target):
         win = tk.Tk()
-        win.title(f'{name} · {day}')
+        win.title(title)
+        countdown = tk.StringVar(master=win)
+        tk.Label(win, textvariable=countdown).pack(padx=24, pady=12)
+        tk.Button(win, text='取消', command=win.destroy).pack(pady=8)
+        finished = False
+
+        def tick():
+            nonlocal finished
+            remaining = (target - self.school_now()).total_seconds()
+            if remaining <= 0:
+                finished = True
+                win.destroy()
+                return
+            countdown.set(f'北京时间 {target:%m-%d %H:%M:%S} 执行，剩余 {int(remaining) + 1} 秒')
+            win.after(min(1000, max(1, int(remaining * 1000))), tick)
+
+        win.after(0, tick)
+        win.mainloop()
+        return finished
+
+    # 预约前重新检查该时段和场地状态；提交后不把点击成功当成订单成功。
+    def _book_court(self, item):
+        rows = self._select_slot(item['time'])
+        if item['idx'] > len(rows):
+            raise ReserveError('场地列表已变化，请重新扫描。')
+        court, court_id, status = rows[item['idx'] - 1]
+        if court_id != item['court_id'] or status != '可预约':
+            raise ReserveError('场地状态已变化，请重新扫描。')
+        court.click()
+        try:
+            identity = self.browser.find_element(By.ID, 'partnerCardType1')
+            self.browser.execute_script('arguments[0].click();', identity)
+        except NoSuchElementException:
+            pass
+        confirmation = (By.XPATH, '//*[@id="command"]/div[3]/input[3]')
+        self.wait.until(EC.element_to_be_clickable(confirmation)).click()
+        try:
+            decision = self.browser.find_element(By.XPATH, '//*[@id="dialog_1"]/div[2]/div/div/div[2]/div')
+            self.browser.execute_script('arguments[0].click();', decision)
+        except NoSuchElementException:
+            pass
+
+    def _payment_codes(self):
+        url = urlsplit(self.browser.current_url)
+        if url.scheme != 'https' or url.netloc not in (self.VENUE_HOST, self.PAYMENT_HOST):
+            return []
+        return self.browser.execute_script(PAYMENT_CODE_JS)
+
+    def _wait_payment_code(self, booking_window, old_windows, previous_codes):
+        def find_code(_):
+            matches = []
+            for window in self.browser.window_handles:
+                if window != booking_window and window in old_windows:
+                    continue
+                try:
+                    self.browser.switch_to.window(window)
+                    for element in self._payment_codes():
+                        if window != booking_window or element.id not in previous_codes:
+                            matches.append((window, element))
+                except NoSuchWindowException:
+                    continue
+            if len(matches) != 1:
+                return None
+            window, element = matches[0]
+            try:
+                self.browser.switch_to.window(window)
+                return element.screenshot_as_base64
+            except NoSuchWindowException:
+                return None
+
+        try:
+            return self.wait.until(find_code)
+        finally:
+            if booking_window in self.browser.window_handles:
+                try:
+                    self.browser.switch_to.window(booking_window)
+                except NoSuchWindowException:
+                    pass
+
+    # 付款码仅在本地窗口显示，用户核对订单和金额后自行扫码。
+    def show_payment_code(self, image_data, parent):
+        win = tk.Toplevel(parent) if parent else tk.Tk()
+        win.title('订单待付款 · 支付二维码')
+        image = tk.PhotoImage(master=win, data=image_data, format='png')
+        tk.Label(win, text='请先核对收款方、订单和金额，再用手机扫码。').pack(padx=16, pady=8)
+        tk.Label(win, image=image).pack(padx=12, pady=8)
+        tk.Button(win, text='关闭', command=win.destroy).pack(pady=8)
+        if parent:
+            win.transient(parent)
+            win.grab_set()
+            win.wait_window()
+        else:
+            win.mainloop()
+
+    def show_booking_result(self, item, parent=None):
+        try:
+            booking_window = self.browser.current_window_handle
+            old_windows = set(self.browser.window_handles)
+            previous_codes = {element.id for element in self._payment_codes()}
+            self._book_court(item)
+        except ReserveError as error:
+            messagebox.showerror('预约未完成', str(error))
+            return
+        except WebDriverException:
+            messagebox.showerror('预约未确认', '请在学校系统核对订单后，再决定是否重试。')
+            return
+
+        try:
+            payment_code = self._wait_payment_code(booking_window, old_windows, previous_codes)
+            self.show_payment_code(payment_code, parent)
+        except (WebDriverException, tk.TclError):
+            messagebox.showinfo('请核对订单', '已提交预约操作，但未取得唯一的付款码。'
+                                '请在学校场地系统的预约记录中查看订单和付款状态，勿重复提交。')
+
+    def attempt_reservation(self, name, visit_date, slots):
+        """返回 True 表示任务应停止；只有确认无空场时才允许下一轮。"""
+        results, unconfirmed = self.scan_target(name, visit_date, slots)
+        if unconfirmed:
+            messagebox.showwarning('状态未确认', '未能确认学校页面的最新场地状态，已停止。')
+            return True
+        available = next((item for item in results if item['status'] == '可预约'), None)
+        if available is None:
+            return False
+        self.show_booking_result(available)
+        return True
+
+    # 即时检索的结果窗口：由用户选择场地并单独确认预约。
+    def scenes(self, name, visit_date, results, unconfirmed):
+        win = tk.Tk()
+        win.title(f'{name} · {visit_date:%Y-%m-%d}')
         win.geometry('480x460')
         lines = [
             f"{item['label']} · 第 {item['idx']} 场地 · {item['status']}"
-            for item in self.en_list
+            for item in results
         ]
         if unconfirmed:
             tk.Label(win, text=f'以下时段未能确认或未扫描：{", ".join(unconfirmed)}',
@@ -587,8 +598,8 @@ class HustReserve:
         scrollbar = tk.Scrollbar(win)
         lb = tk.Listbox(win, width=60, yscrollcommand=scrollbar.set)
         scrollbar.config(command=lb.yview)
-        for s in lines:
-            lb.insert(tk.END, s)
+        for line in lines:
+            lb.insert(tk.END, line)
 
         def book():
             if unconfirmed:
@@ -597,39 +608,13 @@ class HustReserve:
                 sel = lb.curselection()[0]
             except (IndexError, tk.TclError):
                 return
-            item = self.en_list[sel]
+            item = results[sel]
             if item['status'] != '可预约':
                 messagebox.showerror('错误', '请预约可预约的场地')
                 return
             if not messagebox.askyesno('提示', '是否确认预定该场地'):
                 return
-            try:
-                rows = self._select_slot(item['time'])
-                if item['idx'] > len(rows):
-                    raise ReserveError('场地列表已变化，请重新扫描。')
-                court, court_id, status = rows[item['idx'] - 1]
-                if court_id != item['court_id'] or status != '可预约':
-                    raise ReserveError('场地状态已变化，请重新扫描。')
-                court.click()
-                try:
-                    enter = self.browser.find_element(By.ID, 'partnerCardType1')
-                    self.browser.execute_script('arguments[0].click();', enter)
-                except NoSuchElementException:
-                    pass
-                confirm = self.browser.find_element(
-                    By.XPATH, '//*[@id="command"]/div[3]/input[3]')
-                self.browser.execute_script('arguments[0].click();', confirm)
-                try:
-                    decision = self.browser.find_element(
-                        By.XPATH, '//*[@id="dialog_1"]/div[2]/div/div/div[2]/div')
-                    self.browser.execute_script('arguments[0].click();', decision)
-                except NoSuchElementException:
-                    pass
-                messagebox.showinfo('提示', '已发送预约操作，请在学校页面确认订单状态。')
-            except ReserveError as error:
-                messagebox.showerror('预约未完成', str(error))
-            except WebDriverException:
-                messagebox.showerror('预约未确认', '请在学校页面核对订单后，再决定是否重试。')
+            self.show_booking_result(item, parent=win)
 
         tk.Button(win, text='关闭结果，返回场馆选择', command=win.destroy).pack(side='bottom')
         if not unconfirmed:
@@ -637,12 +622,3 @@ class HustReserve:
         scrollbar.pack(side='right', fill='y')
         lb.pack(side='left', fill='both', expand=True)
         win.mainloop()
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='华中科技大学体育场地查询')
-    parser.add_argument('--env-file', default='.env', help='登录配置文件（默认 .env）')
-    parser.add_argument('--headless', action='store_true', help='隐藏 Edge 窗口，仍需桌面显示验证码')
-    parser.add_argument('--manual-captcha', action='store_true', help='始终手动输入图形验证码')
-    args = parser.parse_args()
-    HustReserve(args.env_file, args.headless, args.manual_captcha).run()
