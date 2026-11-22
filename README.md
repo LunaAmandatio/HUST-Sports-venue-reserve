@@ -1,44 +1,25 @@
-# 欢迎查看华中科技大学体育场地检索小程序与定时订场脚本  
-  
+# HUST 体育场地查询
 
-## 注意
-**本程序仅供Python学习与帮助华中科技大学同学们更方便预定体育场地之用，切勿用于非法用途**  
-   
-***
-### 项目结构如下:  
-.  
-├── 华科场地检索小程序.py  
-├── 定时8点开抢.py    
-├── 重复抢场.py   
-├── README.md  
-├── 个人信息.env  
-├── 华科场地检索小程序.exe   
-├── 华科场地检索小程序配置文件.zip          
-├── 定时8点开抢.exe  
-├──定时8点开抢配置文件.zip
+使用华中科技大学统一身份认证登录体育场地系统。登录后选择一个场馆和日期，可扫描选中时段或全天；扫描只读取场地状态，不会提交预约。
 
-### 使用的第三方库：
-* selenium  
-* tkinter  
-* dotenv  
-* os  
-* time
-* APScheduler
+## 安装与运行
 
-___
-### 使用说明：
-### 1:
-* 请于env文件中填写你的**学号**与**账号密码**,形式如下：
-* account=114514  
-password=88888888  
-### 2:
-* 请手动输入验证码，不要输错太多次,会被封号大概5分钟  
-### 3:  
-* 如需安装第三方库，请复制以下命令至Python终端执行：pip install selenium,dotenv，APScheduler
-* 如果你不想下第三方库请解压小程序对应的配置文件，并将对应名称的exe文件与解压后配置文件放于同级文件夹
-### 4:
-* 华科场地检索小程序适合日常查找空余场地
-* 定时8点开抢使用APScheduler的cron触发器，使程序于8点时自动运行，但注意提前选择场馆信息
-* 重复抢场使用APScheduler的interval触发器，使程序于启动后，间隔5s重复执行抢场命令
----
-希望你能在HUST享受体育的乐趣
+需要 Python 3.10+、Tk 桌面环境和 Microsoft Edge。Windows 和 macOS 可使用 python.org 提供的 Python；Linux 如果缺少 Tk，请安装发行版的 Tkinter 软件包，例如 Ubuntu 的 `python3-tk`。Selenium 会尝试管理对应的 Edge WebDriver，首次运行可能需要联网；离线环境可将与 Edge 匹配的 `msedgedriver` 放在 `PATH` 中。
+
+```sh
+python -m pip install -r requirements.txt
+python hust_reserve.py
+```
+
+运行前，将 `.env.example` 复制到同目录的 `.env`（Windows PowerShell：`Copy-Item .env.example .env`；macOS/Linux：`cp .env.example .env`），填入自己的 `account` 和 `password`。`.env` 不纳入版本控制，本地文件仍是明文，请仅在自己的设备上保存。也可通过环境变量提供账号密码，或用 `--env-file` 指定其他配置文件。
+
+1. 点击 **登录并查询**。程序自动填写账号密码；学校显示图形验证码时，使用现有的 GIF 识别脚本，识别失败或被拒后改为手动输入。用 `--manual-captcha` 可完全关闭图形码自动识别及其 CDN 依赖。
+2. 仅在学校要求双因子认证时，输入学校发来的动态码。动态码、验证码图片和浏览器会话不保存到项目中。用 `--headless` 可隐藏 Edge，但验证码窗口仍需要桌面环境。
+3. 选择场馆以及今天、明天或后天，点 **扫描选中时段** 或 **扫描全天**。时段由学校页面提供；若状态更新无法确认，程序会标明受影响的时段，不把它们当作无空场。
+4. 需要预约时，在完整的扫描结果中选中状态为“可预约”的场地，再手动确认。最终以学校页面显示的订单状态为准。
+
+## 验证与旧版
+
+- GitHub Actions 在 Windows、macOS 和 Linux 上验证 Python 语法、依赖导入和新版命令行入口；不访问学校，也不验证真实登录或预约。
+- `legacy_venue_search.py`、`scheduled_reservation.py`、`repeat_reservation.py` 是旧版脚本，不包含新版双因子流程。旧版定时脚本另需安装 `APScheduler` 3.x。
+- 仓库仅分发源码和配置，不再分发旧版 EXE 或 ZIP。
